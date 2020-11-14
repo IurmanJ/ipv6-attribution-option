@@ -1,0 +1,389 @@
+diff --git a/include/uapi/linux/in6.h b/include/uapi/linux/in6.h
+index 5ad396a57eb3..22df89359249 100644
+--- a/include/uapi/linux/in6.h
++++ b/include/uapi/linux/in6.h
+@@ -145,6 +145,8 @@ struct in6_flowlabel_req {
+ #define IPV6_TLV_PADN		1
+ #define IPV6_TLV_ROUTERALERT	5
+ #define IPV6_TLV_CALIPSO	7	/* RFC 5570 */
++#define IPV6_TLV_ATTRIBUTION	31	/* Experimental draft-herbert-6man-eh-attrib */
++#define IPV6_TLV_IOAM_HOPOPTS	49	/* Experimental IOAM */
+ #define IPV6_TLV_JUMBO		194
+ #define IPV6_TLV_HAO		201	/* home address option */
+ 
+diff --git a/net/ipv6/exthdrs.c b/net/ipv6/exthdrs.c
+index 374105e4394f..b7d9532a3e6f 100644
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@ -52,17 +52,27 @@
+ 
+ #include <linux/uaccess.h>
+ 
+-/*
+- *	Parsing tlv encoded headers.
++/* States for TLV parsing functions. */
++
++enum {
++	TLV_ACCEPT,
++	TLV_REJECT,
++	TLV_REMOVE,
++	__TLV_MAX
++};
++
++/* Parsing TLV encoded headers.
+  *
+- *	Parsing function "func" returns true, if parsing succeed
+- *	and false, if it failed.
+- *	It MUST NOT touch skb->h.
++ * Parsing function "func" returns either:
++ *  - TLV_ACCEPT if parsing succeeds
++ *  - TLV_REJECT if parsing fails
++ *  - TLV_REMOVE if TLV must be removed
++ * It MUST NOT touch skb->h.
+  */
+ 
+ struct tlvtype_proc {
+ 	int	type;
+-	bool	(*func)(struct sk_buff *skb, int offset);
++	int	(*func)(struct sk_buff *skb, int offset);
+ };
+ 
+ /*********************
+@@ -109,19 +119,80 @@ static bool ip6_tlvopt_unknown(struct sk_buff *skb, int optoff,
+ 	return false;
+ }
+ 
++/* Remove one or several consecutive TLVs and recompute offsets, lengths */
++
++static int remove_tlv(int start, int end, struct sk_buff *skb)
++{
++	int len = end - start;
++	int padlen = len % 8;
++	unsigned char *h;
++	int rlen, off;
++	bool pop_hbh;
++	u16 pl_len;
++	u8 nexthdr;
++
++	rlen = len - padlen;
++	if (rlen) {
++		nexthdr = skb_transport_header(skb)[0];
++		pop_hbh = (start == skb_transport_offset(skb));
++
++		skb_pull(skb, rlen);
++		memmove(skb_network_header(skb) + rlen, skb_network_header(skb),
++			start);
++		skb_postpull_rcsum(skb, skb_network_header(skb), rlen);
++
++		skb_reset_network_header(skb);
++		skb_set_transport_header(skb, sizeof(struct ipv6hdr));
++
++		pl_len = be16_to_cpu(ipv6_hdr(skb)->payload_len) - rlen;
++		ipv6_hdr(skb)->payload_len = cpu_to_be16(pl_len);
++
++		end -= rlen;
++		if (pop_hbh)
++			ipv6_hdr(skb)->nexthdr = nexthdr;
++		else
++			skb_transport_header(skb)[1] -= rlen >> 3;
++	}
++
++	if (padlen) {
++		off = end - padlen;
++		h = skb_network_header(skb);
++
++		if (padlen == 1) {
++			h[off] = IPV6_TLV_PAD1;
++		} else {
++			padlen -= 2;
++
++			h[off] = IPV6_TLV_PADN;
++			h[off + 1] = padlen;
++			memset(&h[off + 2], 0, padlen);
++		}
++	}
++
++	return end;
++}
++
+ /* Parse tlv encoded option header (hop-by-hop or destination) */
+ 
+ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
+ 			  struct sk_buff *skb,
+-			  int max_count)
++			  int max_count,
++			  bool removable)
+ {
+ 	int len = (skb_transport_header(skb)[1] + 1) << 3;
+-	const unsigned char *nh = skb_network_header(skb);
++	unsigned char *nh = skb_network_header(skb);
+ 	int off = skb_network_header_len(skb);
+ 	const struct tlvtype_proc *curr;
+ 	bool disallow_unknowns = false;
++	int attrib_off = 0;
++	int attrib_end = 0;
++	int attrib_num = 0;
+ 	int tlv_count = 0;
++	int attrib_opts;
++	int attrib_cnt;
++	bool attrib_rm;
+ 	int padlen = 0;
++	int ret;
+ 
+ 	if (unlikely(max_count < 0)) {
+ 		disallow_unknowns = true;
+@@ -165,6 +236,53 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
+ 			}
+ 			break;
+ 
++		case IPV6_TLV_ATTRIBUTION:
++			/* draft-herbert-6man-eh-attrib provides attribution for
++			 * IPv6 extension headers, Hop-by-Hop options, or
++			 * Destination options that are inserted by intermediate
++			 * nodes in the delivery path of a packet.
++			 */
++			if (off % 8 != 2)
++				goto bad;
++
++			if (!attrib_num) {
++				/* This is the very first Attribution Option we
++				 * see, so there MUST NOT be a TLV (padding
++				 * not included) before it.
++				 */
++				if (tlv_count)
++					goto bad;
++			} else {
++				/* Num_Opts = 127 is only valid for the very
++				 * first (bottom stack) Attribution Option.
++				 */
++				if (attrib_opts == 127)
++					goto bad;
++
++				/* Check the number of options for the previous
++				 * Attribution Option.
++				 */
++				if (attrib_cnt != attrib_opts)
++					goto bad;
++
++				/* Was a remove requested for at least an option
++				 * of the previous Attribution Option? If so,
++				 * it MUST be at the top of the stack.
++				 */
++				if (removable && attrib_rm && attrib_num == 1) {
++					off = remove_tlv(attrib_off, off, skb);
++					nh = skb_network_header(skb);
++				}
++			}
++
++			attrib_off = off - padlen;
++			attrib_opts = nh[off + 2] & 0x7f;
++
++			attrib_rm = false;
++			attrib_cnt = 0;
++			attrib_num++;
++			break;
++
+ 		default: /* Other TLV code so scan list */
+ 			if (optlen > len)
+ 				goto bad;
+@@ -173,12 +291,14 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
+ 			if (tlv_count > max_count)
+ 				goto bad;
+ 
++			ret = -1;
+ 			for (curr = procs; curr->type >= 0; curr++) {
+ 				if (curr->type == nh[off]) {
+ 					/* type specific length/alignment
+ 					   checks will be performed in the
+ 					   func(). */
+-					if (curr->func(skb, off) == false)
++					ret = curr->func(skb, off);
++					if (ret == TLV_REJECT)
+ 						return false;
+ 					break;
+ 				}
+@@ -187,6 +307,13 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
+ 			    !ip6_tlvopt_unknown(skb, off, disallow_unknowns))
+ 				return false;
+ 
++			if (attrib_num) {
++				if (attrib_cnt++ == attrib_opts)
++					attrib_end = off;
++				if (ret == TLV_REMOVE)
++					attrib_rm = true;
++			}
++
+ 			padlen = 0;
+ 			break;
+ 		}
+@@ -194,8 +321,23 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
+ 		len -= optlen;
+ 	}
+ 
+-	if (len == 0)
++	if (len == 0) {
++		if (attrib_num) {
++			if (attrib_cnt < attrib_opts && attrib_opts < 127)
++				goto bad;
++
++			if (removable && attrib_rm && attrib_num == 1) {
++				if (attrib_opts == 127)
++					remove_tlv(skb_transport_offset(skb),
++						   skb_transport_offset(skb) + ((skb_transport_header(skb)[1] + 1) << 3),
++	     					   skb);
++				else
++					remove_tlv(attrib_off, attrib_end, skb);
++			}
++		}
++
+ 		return true;
++	}
+ bad:
+ 	kfree_skb(skb);
+ 	return false;
+@@ -206,7 +348,7 @@ static bool ip6_parse_tlv(const struct tlvtype_proc *procs,
+  *****************************/
+ 
+ #if IS_ENABLED(CONFIG_IPV6_MIP6)
+-static bool ipv6_dest_hao(struct sk_buff *skb, int optoff)
++static int ipv6_dest_hao(struct sk_buff *skb, int optoff)
+ {
+ 	struct ipv6_destopt_hao *hao;
+ 	struct inet6_skb_parm *opt = IP6CB(skb);
+@@ -257,11 +399,11 @@ static bool ipv6_dest_hao(struct sk_buff *skb, int optoff)
+ 	if (skb->tstamp == 0)
+ 		__net_timestamp(skb);
+ 
+-	return true;
++	return TLV_ACCEPT;
+ 
+  discard:
+ 	kfree_skb(skb);
+-	return false;
++	return TLV_REJECT;
+ }
+ #endif
+ 
+@@ -306,7 +448,8 @@ static int ipv6_destopt_rcv(struct sk_buff *skb)
+ #endif
+ 
+ 	if (ip6_parse_tlv(tlvprocdestopt_lst, skb,
+-			  init_net.ipv6.sysctl.max_dst_opts_cnt)) {
++			  init_net.ipv6.sysctl.max_dst_opts_cnt,
++			  false)) {
+ 		skb->transport_header += extlen;
+ 		opt = IP6CB(skb);
+ #if IS_ENABLED(CONFIG_IPV6_MIP6)
+@@ -918,24 +1061,24 @@ static inline struct net *ipv6_skb_net(struct sk_buff *skb)
+ 
+ /* Router Alert as of RFC 2711 */
+ 
+-static bool ipv6_hop_ra(struct sk_buff *skb, int optoff)
++static int ipv6_hop_ra(struct sk_buff *skb, int optoff)
+ {
+ 	const unsigned char *nh = skb_network_header(skb);
+ 
+ 	if (nh[optoff + 1] == 2) {
+ 		IP6CB(skb)->flags |= IP6SKB_ROUTERALERT;
+ 		memcpy(&IP6CB(skb)->ra, nh + optoff + 2, sizeof(IP6CB(skb)->ra));
+-		return true;
++		return TLV_ACCEPT;
+ 	}
+ 	net_dbg_ratelimited("ipv6_hop_ra: wrong RA length %d\n",
+ 			    nh[optoff + 1]);
+ 	kfree_skb(skb);
+-	return false;
++	return TLV_REJECT;
+ }
+ 
+ /* Jumbo payload */
+ 
+-static bool ipv6_hop_jumbo(struct sk_buff *skb, int optoff)
++static int ipv6_hop_jumbo(struct sk_buff *skb, int optoff)
+ {
+ 	const unsigned char *nh = skb_network_header(skb);
+ 	struct inet6_dev *idev = __in6_dev_get_safely(skb->dev);
+@@ -953,12 +1096,12 @@ static bool ipv6_hop_jumbo(struct sk_buff *skb, int optoff)
+ 	if (pkt_len <= IPV6_MAXPLEN) {
+ 		__IP6_INC_STATS(net, idev, IPSTATS_MIB_INHDRERRORS);
+ 		icmpv6_param_prob(skb, ICMPV6_HDR_FIELD, optoff+2);
+-		return false;
++		return TLV_REJECT;
+ 	}
+ 	if (ipv6_hdr(skb)->payload_len) {
+ 		__IP6_INC_STATS(net, idev, IPSTATS_MIB_INHDRERRORS);
+ 		icmpv6_param_prob(skb, ICMPV6_HDR_FIELD, optoff);
+-		return false;
++		return TLV_REJECT;
+ 	}
+ 
+ 	if (pkt_len > skb->len - sizeof(struct ipv6hdr)) {
+@@ -970,16 +1113,16 @@ static bool ipv6_hop_jumbo(struct sk_buff *skb, int optoff)
+ 		goto drop;
+ 
+ 	IP6CB(skb)->flags |= IP6SKB_JUMBOGRAM;
+-	return true;
++	return TLV_ACCEPT;
+ 
+ drop:
+ 	kfree_skb(skb);
+-	return false;
++	return TLV_REJECT;
+ }
+ 
+ /* CALIPSO RFC 5570 */
+ 
+-static bool ipv6_hop_calipso(struct sk_buff *skb, int optoff)
++static int ipv6_hop_calipso(struct sk_buff *skb, int optoff)
+ {
+ 	const unsigned char *nh = skb_network_header(skb);
+ 
+@@ -992,11 +1135,16 @@ static bool ipv6_hop_calipso(struct sk_buff *skb, int optoff)
+ 	if (!calipso_validate(skb, nh + optoff))
+ 		goto drop;
+ 
+-	return true;
++	return TLV_ACCEPT;
+ 
+ drop:
+ 	kfree_skb(skb);
+-	return false;
++	return TLV_REJECT;
++}
++
++static int ipv6_hop_ioam(struct sk_buff *skb, int optoff)
++{
++	return TLV_REMOVE;
+ }
+ 
+ static const struct tlvtype_proc tlvprochopopt_lst[] = {
+@@ -1012,6 +1160,10 @@ static const struct tlvtype_proc tlvprochopopt_lst[] = {
+ 		.type	= IPV6_TLV_CALIPSO,
+ 		.func	= ipv6_hop_calipso,
+ 	},
++	{
++		.type	= IPV6_TLV_IOAM_HOPOPTS,
++		.func	= ipv6_hop_ioam,
++	},
+ 	{ -1, }
+ };
+ 
+@@ -1041,7 +1193,17 @@ int ipv6_parse_hopopts(struct sk_buff *skb)
+ 
+ 	opt->flags |= IP6SKB_HOPBYHOP;
+ 	if (ip6_parse_tlv(tlvprochopopt_lst, skb,
+-			  init_net.ipv6.sysctl.max_hbh_opts_cnt)) {
++			  init_net.ipv6.sysctl.max_hbh_opts_cnt,
++			  true)) {
++		/* In case the entire Hop-by-Hop was removed */
++		if (ipv6_hdr(skb)->nexthdr != NEXTHDR_HOP) {
++			opt->flags &= ~IP6SKB_HOPBYHOP;
++			return 1;
++		}
++		/* we need to refresh the length in case
++		 * at least one TLV was removed
++		 */
++		extlen = (skb_transport_header(skb)[1] + 1) << 3;
+ 		skb->transport_header += extlen;
+ 		opt = IP6CB(skb);
+ 		opt->nhoff = sizeof(struct ipv6hdr);
